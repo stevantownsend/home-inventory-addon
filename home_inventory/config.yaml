@@ -1,0 +1,26 @@
+name: Home Inventory
+version: "1.0.0"
+slug: home_inventory
+description: Catalog your home's appliances and equipment - make, model, serial, purchase, warranty, support, manuals, photos and maintenance reminders.
+arch:
+  - aarch64
+  - amd64
+  - armv7
+init: false
+startup: application
+boot: auto
+# Served inside Home Assistant (sidebar + companion app), behind HA login
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:home-search
+panel_title: Home Inventory
+# Lets the add-on publish sensors (maintenance due, warranties expiring)
+homeassistant_api: true
+# Include the inventory database & photos in HA backups
+backup: hot
+options:
+  publish_sensors: true
+  warranty_warning_days: 60
+schema:
+  publish_sensors: bool
+  warranty_warning_days: int(1,3650)
