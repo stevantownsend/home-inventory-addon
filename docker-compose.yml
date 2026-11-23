@@ -1,0 +1,22 @@
+# Home Inventory for Home Assistant Container / Core installs.
+# Settings go in a file named .env next to this one (see INSTALL-DOCKER.md):
+#   TZ=America/Chicago
+#   HA_TOKEN=<long-lived access token>
+# Start / update with:  docker compose up -d --build
+services:
+  home-inventory:
+    build:
+      context: ./home_inventory
+      dockerfile: Dockerfile.standalone
+    container_name: home-inventory
+    restart: unless-stopped
+    # Shares the Pi's network: reaches Home Assistant at localhost:8123,
+    # and you open the app at http://<pi-address>:8099
+    network_mode: host
+    volumes:
+      - ./data:/data          # inventory database + photos
+    environment:
+      TZ: ${TZ:-UTC}
+      HA_URL: ${HA_URL:-http://localhost:8123}
+      HA_TOKEN: ${HA_TOKEN:-}
+      WARRANTY_WARNING_DAYS: ${WARRANTY_WARNING_DAYS:-60}

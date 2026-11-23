@@ -4,7 +4,10 @@ A mobile-friendly inventory for your house (make, model, serial, purchase, warra
 manuals, photos, operating notes, maintenance reminders). It runs on your Raspberry Pi as a Home Assistant
 add-on and shows up in the HA sidebar and the companion app. See [home_inventory/DOCS.md](home_inventory/DOCS.md).
 
-## Install (local add-on, no GitHub needed)
+> **Home Assistant Container or Core?** If HA says *"Apps require the Home Assistant Operating System"*,
+> follow **[INSTALL-DOCKER.md](INSTALL-DOCKER.md)** instead. It runs as a Docker container on the Pi.
+
+## Install on Home Assistant OS (local add-on, no GitHub needed)
 
 1. In Home Assistant, install the **Samba share** or **Advanced SSH & Web Terminal** add-on
    (Settings → Add-ons → Add-on Store) so you can copy files to the Pi.
