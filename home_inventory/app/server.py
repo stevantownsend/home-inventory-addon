@@ -12,6 +12,7 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta
@@ -39,8 +40,19 @@ def load_options():
 
 
 OPTIONS = load_options()
-PUBLISH_SENSORS = bool(SUPERVISOR_TOKEN) and OPTIONS.get("publish_sensors", True)
-WARRANTY_DAYS = int(OPTIONS.get("warranty_warning_days", 60))
+
+# Where to publish sensors:
+#  - as an HA OS add-on: through the Supervisor proxy (token provided automatically)
+#  - standalone (HA Container/Core): HA_URL + a long-lived access token in HA_TOKEN
+if SUPERVISOR_TOKEN:
+    HA_API, HA_AUTH = "http://supervisor/core/api", SUPERVISOR_TOKEN
+elif os.environ.get("HA_TOKEN", "").strip():
+    HA_API = os.environ.get("HA_URL", "http://localhost:8123").strip().rstrip("/") + "/api"
+    HA_AUTH = os.environ["HA_TOKEN"].strip()
+else:
+    HA_API, HA_AUTH = None, None
+PUBLISH_SENSORS = bool(HA_AUTH) and OPTIONS.get("publish_sensors", True)
+WARRANTY_DAYS = int(OPTIONS.get("warranty_warning_days", os.environ.get("WARRANTY_WARNING_DAYS", 60)))
 
 # Plain text columns on an item. Add a name here and it is created on next start.
 ITEM_FIELDS = [
@@ -482,10 +494,10 @@ def changed():
 
 def ha_set_state(entity_id, state, attributes):
     req = urllib.request.Request(
-        f"http://supervisor/core/api/states/{entity_id}",
+        f"{HA_API}/states/{entity_id}",
         data=json.dumps({"state": state, "attributes": attributes}).encode(),
         method="POST",
-        headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"})
+        headers={"Authorization": f"Bearer {HA_AUTH}", "Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10).read()
 
 
@@ -525,8 +537,11 @@ def publisher_loop():
     while True:
         try:
             publish_sensors()
+        except urllib.error.HTTPError as e:
+            hint = " - check HA_TOKEN" if e.code == 401 else ""
+            print(f"[home_inventory] Home Assistant rejected sensor update: {e}{hint}", flush=True)
         except Exception as e:  # HA restarting, etc. - retry on next tick
-            print(f"[home_inventory] could not publish sensors: {e}", flush=True)
+            print(f"[home_inventory] could not reach Home Assistant at {HA_API}: {e}", flush=True)
         _wake.wait(timeout=900)  # refresh every 15 min (also restores after HA restarts)
         _wake.clear()
         time.sleep(2)  # coalesce bursts of edits
