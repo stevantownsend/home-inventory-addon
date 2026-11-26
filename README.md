@@ -4,6 +4,9 @@ A mobile-friendly inventory for your house (make, model, serial, purchase, warra
 manuals, photos, operating notes, maintenance reminders). It runs on your Raspberry Pi as a Home Assistant
 add-on and shows up in the HA sidebar and the companion app. See [home_inventory/DOCS.md](home_inventory/DOCS.md).
 
+**Bulk loading:** import items from Excel (.xlsx) or CSV inside the app (home screen → *Import from Excel / CSV*),
+or from scripts through the JSON API: see [API.md](API.md).
+
 > **Home Assistant Container or Core?** If HA says *"Apps require the Home Assistant Operating System"*,
 > follow **[INSTALL-DOCKER.md](INSTALL-DOCKER.md)** instead. It runs as a Docker container on the Pi.
 
