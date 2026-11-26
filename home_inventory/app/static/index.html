@@ -16,7 +16,12 @@
     <span id="topaction"></span>
   </header>
   <main id="app" aria-live="polite"></main>
-  <dialog id="lightbox"><img alt=""><button class="iconbtn close" aria-label="Close">✕</button></dialog>
+  <dialog id="lightbox" aria-label="Photo">
+    <img alt="">
+    <div class="lb-foot"><div class="lb-title"></div><div class="lb-bar"></div></div>
+    <button class="iconbtn close" aria-label="Close">✕</button>
+  </dialog>
+  <dialog id="sheet"></dialog>
   <div id="toast" role="status"></div>
   <script src="app.js"></script>
 </body>
