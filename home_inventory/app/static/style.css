@@ -300,3 +300,10 @@ label.check { display: flex; gap: 10px; align-items: flex-start; font-weight: 40
 label.check input { width: 20px; height: 20px; margin-top: 2px; flex: none; }
 .problems { background: var(--bad-bg); color: var(--bad-text); border-radius: 10px; padding: 10px 12px; font-size: 14px; display: grid; gap: 4px; }
 .card.done { border-color: var(--ok-text); }
+
+/* uploaded icons: sized relative to the surrounding emoji size */
+.ico-img { display: inline-block; width: 1.15em; height: 1.15em; object-fit: contain; vertical-align: -0.2em; }
+.thumb .ico-img { width: 66%; height: 66%; vertical-align: middle; }
+.term-icon { display: inline-grid; place-items: center; }
+.term-icon .ico-img { width: 30px; height: 30px; }
+.emoji-grid button img { width: 30px; height: 30px; object-fit: contain; display: block; margin: auto; }

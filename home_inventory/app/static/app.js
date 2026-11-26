@@ -45,9 +45,15 @@ function termIcon(kind, name) {
   return (t && t.icon) || (kind === 'locations' ? '📍' : '📦');
 }
 const catIcon = (name) => termIcon('categories', name);
+/** An icon value is an emoji, or "img:<id>" for an uploaded icon. */
+function iconHtml(v) {
+  const m = /^img:(\d+)$/.exec(v || '');
+  return m ? `<img class="ico-img" src="api/icons/${m[1]}" alt="">` : esc(v || '');
+}
+const iconText = (v) => (/^img:/.test(v || '') ? '' : (v || '')); // for <option>, which can't show images
 const itemIcon = (it) => it.icon || catIcon(it.category);
 function thumbHtml(it) {
-  return it.thumb_id ? `<img src="${attUrl(it.thumb_id)}" alt="" loading="lazy">` : esc(itemIcon(it));
+  return it.thumb_id ? `<img src="${attUrl(it.thumb_id)}" alt="" loading="lazy">` : iconHtml(itemIcon(it));
 }
 
 function fmtDate(iso) {
@@ -158,7 +164,14 @@ function pickIcon({ title, current, photos = [], coverId = null, resetLabel }) {
         <div class="pick-photos">${photos.map((p) => `
           <button type="button" data-pick="photo:${p.id}" class="${p.id === coverId ? 'sel' : ''}" aria-label="Use photo ${esc(p.title || p.filename)}">
             <img src="${attUrl(p.id)}" alt="" loading="lazy"></button>`).join('')}</div>` : ''}
-      <h3>${photos.length ? 'Or pick an icon' : 'Pick an icon'}</h3>
+      <h3>Your icons</h3>
+      <div class="emoji-grid" id="myicons">${myIconsGrid(current)}</div>
+      <div class="actions" style="margin:8px 0 0">
+        <label class="btn small">＋ Upload icon<input type="file" id="iconupload" multiple hidden
+          accept="image/png,image/svg+xml,image/jpeg,image/webp,image/gif,.svg"></label>
+        <span class="hint">PNG or SVG works best</span>
+      </div>
+      <h3>${photos.length ? 'Or pick an emoji' : 'Or pick an emoji'}</h3>
       <div class="emoji-grid">${EMOJI.map((e) => `<button type="button" data-pick="emoji:${e}" class="${e === current && !coverId ? 'sel' : ''}">${e}</button>`).join('')}</div>
       <label>Any other emoji
         <div class="inline-input"><input type="text" id="custom-emoji" maxlength="16" placeholder="Type or paste one" autocomplete="off">
@@ -168,8 +181,15 @@ function pickIcon({ title, current, photos = [], coverId = null, resetLabel }) {
         <button type="button" class="btn" data-pick="cancel">Cancel</button>
       </div>`);
     let settled = false;
-    const done = (v) => { if (!settled) { settled = true; resolve(v); } closeSheet(); };
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } s.onclose = null; closeSheet(); };
     s.onclose = () => done(null);
+    s.querySelector('#iconupload').addEventListener('change', async (e) => {
+      const added = await uploadIcons(e.target.files);
+      e.target.value = '';
+      if (!added) return;
+      s.querySelector('#myicons').innerHTML = myIconsGrid(current);
+      if (added.length === 1) done({ emoji: `img:${added[0]}` }); // one new icon: use it right away
+    });
     s.onclick = (e) => {
       if (e.target === s) return done(null);
       const b = e.target.closest('[data-pick]');
@@ -187,6 +207,26 @@ function pickIcon({ title, current, photos = [], coverId = null, resetLabel }) {
   });
 }
 
+function myIconsGrid(current) {
+  const icons = state.meta.icons || [];
+  if (!icons.length) return '<p class="hint" style="grid-column:1/-1;margin:0">No icons uploaded yet.</p>';
+  return icons.map((i) => `<button type="button" data-pick="emoji:img:${i.id}" title="${esc(i.name)}"
+    class="${current === `img:${i.id}` ? 'sel' : ''}" aria-label="Icon ${esc(i.name)}"><img src="api/icons/${i.id}" alt=""></button>`).join('');
+}
+
+/** Upload icon files; returns the new icon ids (or null on failure). */
+async function uploadIcons(files) {
+  if (!files || !files.length) return null;
+  const fd = new FormData();
+  [...files].forEach((f) => fd.append('files', f));
+  try {
+    const res = await api('icons', { method: 'POST', body: fd });
+    state.meta.icons = res.icons;
+    toast(res.errors.length ? `Added ${res.added.length}. Skipped: ${res.errors.join('; ')}` : `Icon${res.added.length > 1 ? 's' : ''} added`);
+    return res.added;
+  } catch (err) { toast(err.message); return null; }
+}
+
 /** Small form in a sheet. fieldsHtml uses named inputs; resolves to their values or null. */
 function formSheet(title, fieldsHtml, submitLabel = 'Save') {
   return new Promise((resolve) => {
@@ -194,7 +234,7 @@ function formSheet(title, fieldsHtml, submitLabel = 'Save') {
       <div class="actions"><button class="btn primary" type="submit">${esc(submitLabel)}</button>
       <button class="btn" type="button" data-close>Cancel</button></div></form>`);
     let settled = false;
-    const done = (v) => { if (!settled) { settled = true; resolve(v); } closeSheet(); };
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } s.onclose = null; closeSheet(); };
     const f = s.querySelector('form');
     s.onclose = () => done(null);
     s.onclick = (e) => { if (e.target === s || e.target.closest('[data-close]')) done(null); };
@@ -300,7 +340,7 @@ function renderList() {
   if (state.filter && !keys.includes(state.filter)) state.filter = '';
   document.getElementById('chips').innerHTML = `
     <button class="chip" data-filter="" aria-pressed="${!state.filter}">All (${state.items.length})</button>
-    ${keys.map((k) => `<button class="chip" data-filter="${esc(k)}" aria-pressed="${state.filter === k}">${esc(groupIcon(k))} ${esc(k)}</button>`).join('')}`;
+    ${keys.map((k) => `<button class="chip" data-filter="${esc(k)}" aria-pressed="${state.filter === k}">${iconHtml(groupIcon(k))} ${esc(k)}</button>`).join('')}`;
 
   const q = state.q.trim().toLowerCase();
   const fields = ['name', 'category', 'location', 'manufacturer', 'model', 'serial_number', 'purchased_from', 'installer', 'notes'];
@@ -315,14 +355,14 @@ function renderList() {
   if (!hits.length) { $list.innerHTML = '<p class="empty">No matching items.</p>'; return; }
   const second = state.groupBy === 'location' ? 'category' : 'location';
   $list.innerHTML = Object.keys(groups).sort((a, b) => a.localeCompare(b)).map((key) => `
-    <h2 class="group-title">${esc(groupIcon(key))} ${esc(key)}</h2>
+    <h2 class="group-title">${iconHtml(groupIcon(key))} ${esc(key)}</h2>
     <div class="list">${groups[key].map((it) => `
       <a class="item" href="#/item/${it.id}">
         <div class="thumb">${thumbHtml(it)}</div>
         <div class="meta">
           <div class="name">${esc(it.name)}</div>
           <div class="sub">${esc([it.manufacturer, it.model].filter(Boolean).join(' · ') || '—')}</div>
-          ${it[second] ? `<div class="sub">${second === 'location' ? '📍' : esc(catIcon(it.category))} ${esc(it[second])}</div>` : ''}
+          ${it[second] ? `<div class="sub">${second === 'location' ? '📍' : iconHtml(catIcon(it.category))} ${esc(it[second])}</div>` : ''}
         </div>
         ${it.tasks_due ? `<span class="badge bad">${it.tasks_due} due</span>` : ''}
       </a>`).join('')}
@@ -388,11 +428,11 @@ async function viewItem(id) {
   $app.innerHTML = `
     <div class="hero">
       <button type="button" class="thumb editable" data-act="icon-pick" aria-label="Change item picture">
-        ${heroImg ? `<img src="${attUrl(heroImg.id)}" alt="">` : esc(itemIcon(it))}
+        ${heroImg ? `<img src="${attUrl(heroImg.id)}" alt="">` : iconHtml(itemIcon(it))}
         <span class="edit-badge" aria-hidden="true">✎</span>
       </button>
       <div><h2>${esc(it.name)}</h2>
-        <div class="sub">${it.category ? `${esc(catIcon(it.category))} ${esc(it.category)}` : ''}${it.category && it.location ? ' · ' : ''}${it.location ? `📍 ${esc(it.location)}` : ''}</div></div>
+        <div class="sub">${it.category ? `${iconHtml(catIcon(it.category))} ${esc(it.category)}` : ''}${it.category && it.location ? ' · ' : ''}${it.location ? `📍 ${esc(it.location)}` : ''}</div></div>
     </div>
 
     ${section('Identification', `<dl>${row('Manufacturer', it.manufacturer)}${row('Model', it.model, true)}${row('Serial number', it.serial_number, true)}</dl>`)}
@@ -549,7 +589,7 @@ async function viewEdit(id) {
     if (it[name] && !names.some((n) => n.toLowerCase() === it[name].toLowerCase())) names.push(it[name]);
     return `<label>${label}<select name="${name}" data-kind="${kind}">
       <option value="">${noneLabel}</option>
-      ${names.map((n) => `<option value="${esc(n)}" ${(it[name] || '').toLowerCase() === n.toLowerCase() ? 'selected' : ''}>${esc(termIcon(kind, n))} ${esc(n)}</option>`).join('')}
+      ${names.map((n) => `<option value="${esc(n)}" ${(it[name] || '').toLowerCase() === n.toLowerCase() ? 'selected' : ''}>${esc(iconText(termIcon(kind, n)))} ${esc(n)}</option>`).join('')}
       <option value="${NEW_OPTION}">＋ Add new…</option></select></label>`;
   };
 
@@ -674,7 +714,7 @@ async function viewManage() {
     const [title, one] = TERM_LABEL[kind];
     const rows = state.meta[kind].map((t) => `
       <div class="term">
-        <button type="button" class="term-icon" data-act="term-icon" data-kind="${kind}" data-id="${t.id}" aria-label="Change icon for ${esc(t.name)}">${esc(termIcon(kind, t.name))}</button>
+        <button type="button" class="term-icon" data-act="term-icon" data-kind="${kind}" data-id="${t.id}" aria-label="Change icon for ${esc(t.name)}">${iconHtml(termIcon(kind, t.name))}</button>
         <div class="meta"><div class="name">${esc(t.name)}</div><div class="sub">${t.count} item${t.count === 1 ? '' : 's'}</div></div>
         <button type="button" class="copy" data-act="term-rename" data-kind="${kind}" data-id="${t.id}">Rename</button>
         <button type="button" class="copy" data-act="term-del" data-kind="${kind}" data-id="${t.id}" aria-label="Delete ${esc(t.name)}">✕</button>
@@ -690,9 +730,28 @@ async function viewManage() {
       </section>`;
   };
   $app.innerHTML = `
-    <p class="hint">Tap an icon to change it. Renaming updates every item that uses it.</p>
+    <p class="hint">Tap an icon to change it, or pick one you uploaded. Renaming updates every item that uses it.</p>
     ${block('categories')}
-    ${block('locations')}`;
+    ${block('locations')}
+    <section class="card">
+      <h3>Your icons <span class="count">${state.meta.icons.length}</span></h3>
+      <p class="hint">Upload your own icons (PNG, SVG, JPG, WebP or GIF, up to 2 MB). Then choose them for items, categories or locations.
+        Square images with a transparent background look best.</p>
+      <div class="actions" style="margin:10px 0">
+        <label class="btn small primary">＋ Upload icons<input type="file" id="manageiconupload" multiple hidden
+          accept="image/png,image/svg+xml,image/jpeg,image/webp,image/gif,.svg"></label>
+      </div>
+      ${state.meta.icons.map((i) => `
+        <div class="term">
+          <span class="term-icon"><img class="ico-img" src="api/icons/${i.id}" alt=""></span>
+          <div class="meta"><div class="name">${esc(i.name)}</div><div class="sub">${i.uses ? `Used ${i.uses} time${i.uses === 1 ? '' : 's'}` : 'Not used yet'}</div></div>
+          <button type="button" class="copy" data-act="icon-rename" data-id="${i.id}">Rename</button>
+          <button type="button" class="copy" data-act="icon-del" data-id="${i.id}" aria-label="Delete icon ${esc(i.name)}">✕</button>
+        </div>`).join('')}
+    </section>`;
+  document.getElementById('manageiconupload').addEventListener('change', async (e) => {
+    if (await uploadIcons(e.target.files)) viewManage();
+  });
 
   $app.querySelectorAll('form.addterm').forEach((f) => f.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -722,13 +781,31 @@ async function termAction(act, kind, id) {
       const res = await formSheet(`Delete “${t.name}”`, `
         <p>${t.count} item${t.count === 1 ? ' uses' : 's use'} this ${one}. Move ${t.count === 1 ? 'it' : 'them'} to:</p>
         <label>Move to<select name="move_to"><option value="">— No ${one} —</option>
-          ${others.map((o) => `<option value="${esc(o.name)}">${esc(termIcon(kind, o.name))} ${esc(o.name)}</option>`).join('')}</select></label>`, 'Delete');
+          ${others.map((o) => `<option value="${esc(o.name)}">${esc(iconText(termIcon(kind, o.name)))} ${esc(o.name)}</option>`).join('')}</select></label>`, 'Delete');
       if (!res) return;
       await api(`${kind}/${id}?move_to=${encodeURIComponent(res.move_to)}`, { method: 'DELETE' });
     } else {
       if (!confirm(`Delete the ${one} “${t.name}”?`)) return;
       await api(`${kind}/${id}`, { method: 'DELETE' });
     }
+  }
+  toast('Saved');
+  viewManage();
+}
+
+async function iconAction(act, id) {
+  const icon = state.meta.icons.find((i) => i.id === id);
+  if (!icon) return;
+  if (act === 'icon-rename') {
+    const res = await formSheet('Rename icon', `<label>Name<input type="text" name="name" value="${esc(icon.name)}" required maxlength="60"></label>`);
+    if (!res || !res.name.trim()) return;
+    await api(`icons/${id}`, { method: 'PUT', json: { name: res.name } });
+  } else {
+    const msg = icon.uses
+      ? `Delete the icon “${icon.name}”? It's used ${icon.uses} time${icon.uses === 1 ? '' : 's'}; those go back to their default icon.`
+      : `Delete the icon “${icon.name}”?`;
+    if (!confirm(msg)) return;
+    await api(`icons/${id}`, { method: 'DELETE' });
   }
   toast('Saved');
   viewManage();
@@ -917,6 +994,7 @@ document.addEventListener('click', async (e) => {
         break;
       case 'term-icon': case 'term-rename': case 'term-del':
         await termAction(el.dataset.act, el.dataset.kind, id); break;
+      case 'icon-rename': case 'icon-del': await iconAction(el.dataset.act, id); break;
     }
   } catch (err) { toast(err.message); }
 });
