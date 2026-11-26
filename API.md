@@ -135,8 +135,16 @@ It does **not** save anything: turn the rows into items and send them to `POST /
 | `POST /api/categories`, `/api/locations` | Add: `{"name", "icon"}` |
 | `PUT /api/categories/{id}`, `/api/locations/{id}` | Rename / change icon (items follow the rename) |
 | `DELETE /api/categories/{id}?move_to=Name` | Delete; items move to `move_to` or become unassigned |
+| `GET /api/icons` | Your uploaded icons (`id`, `name`, how many places use each) |
+| `POST /api/icons` | Upload icons: multipart `files` (PNG, SVG, JPG, WebP, GIF; max 2 MB each), optional `name` |
+| `GET /api/icons/{id}` | The icon image |
+| `PUT /api/icons/{id}` | Rename: `{"name": "Pool pump"}` |
+| `DELETE /api/icons/{id}` | Delete; anything using it goes back to its default icon |
 | `GET /api/summary` | Maintenance due and warranties expiring soon |
 | `GET /api/export.csv`, `/api/export.json` | Full export |
+
+**Icons:** anywhere an `icon` is accepted (item appearance, categories, locations) you can pass an emoji such as
+`"🔥"` or an uploaded icon as `"img:<id>"`, e.g. `{"icon": "img:4"}`.
 
 Attachment `kind` is one of: Photo, Manual, Receipt, Invoice, Contract, Warranty, Permit, Plans & drawings, Other.
 
