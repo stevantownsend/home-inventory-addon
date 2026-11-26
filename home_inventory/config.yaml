@@ -1,5 +1,5 @@
 name: Home Inventory
-version: "1.0.0"
+version: "1.2.0"
 slug: home_inventory
 description: Catalog your home's appliances and equipment - make, model, serial, purchase, warranty, support, manuals, photos and maintenance reminders.
 arch:
