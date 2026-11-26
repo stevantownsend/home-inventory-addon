@@ -9,6 +9,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -18,6 +19,7 @@ import uuid
 from datetime import date, datetime, timedelta
 
 from flask import Flask, Response, abort, g, jsonify, request, send_from_directory
+from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -88,10 +90,41 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_done TEXT,
     notes TEXT
 );
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    icon TEXT
+);
+CREATE TABLE IF NOT EXISTS locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    icon TEXT
+);
 """
+
+# Columns added after v1 (table -> [(column, type)]); created automatically on start.
+LATER_COLUMNS = {
+    "items": [("icon", "TEXT"), ("cover_id", "INTEGER")],
+    "attachments": [("kind", "TEXT"), ("title", "TEXT")],
+}
+
+DEFAULT_CATEGORIES = {
+    "Appliances": "🔌", "HVAC": "🌡️", "Water Heater": "♨️", "Plumbing": "🚰", "Electrical": "⚡",
+    "Lighting": "💡", "Pool & Spa": "🏊", "Outdoor": "🌳", "Irrigation": "💧", "Garage": "🚗",
+    "Doors & Windows": "🚪", "Roof & Exterior": "🏠", "Flooring & Finishes": "🪵",
+    "Security": "🔒", "Smart Home & Network": "📡", "Entertainment": "📺", "Furniture": "🛋️", "Other": "📦",
+}
+
+ATTACHMENT_KINDS = ["Photo", "Manual", "Receipt", "Invoice", "Contract", "Warranty", "Permit",
+                    "Plans & drawings", "Other"]
+
+# Category & location lists share the same code; this maps the URL name to the
+# table and the matching items column (never taken from user input directly).
+TERM_TABLES = {"categories": ("categories", "category"), "locations": ("locations", "location")}
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB per upload request
+app.json.ensure_ascii = False
 
 
 # ---------------------------------------------------------------- database
@@ -110,8 +143,31 @@ def init_db():
     for field in ITEM_FIELDS:
         if field not in existing:
             conn.execute(f"ALTER TABLE items ADD COLUMN {field} TEXT")
+    for table, cols in LATER_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, typ in cols:
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+
+    # One-time: fill the category & location lists (defaults + whatever items already use)
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 2:
+        for name, icon in DEFAULT_CATEGORIES.items():
+            conn.execute("INSERT OR IGNORE INTO categories (name, icon) VALUES (?, ?)", (name, icon))
+        for table, column in TERM_TABLES.values():
+            conn.execute(f"INSERT OR IGNORE INTO {table} (name) "
+                         f"SELECT DISTINCT {column} FROM items WHERE {column} IS NOT NULL")
+        conn.execute("PRAGMA user_version = 2")
     conn.commit()
     conn.close()
+
+
+def canonical_term(conn, url_name, value):
+    """Return the list's spelling of a category/location, adding it if new."""
+    if not value:
+        return None
+    table, _ = TERM_TABLES[url_name]
+    conn.execute(f"INSERT OR IGNORE INTO {table} (name) VALUES (?)", (value,))
+    return conn.execute(f"SELECT name FROM {table} WHERE name = ?", (value,)).fetchone()["name"]
 
 
 def db():
@@ -217,6 +273,14 @@ def only_from_ingress():
         abort(403)
 
 
+@app.errorhandler(HTTPException)
+def http_error(e):
+    # API callers get JSON errors: {"error": "..."}
+    if request.path.startswith("/api/"):
+        return jsonify({"error": e.description}), e.code
+    return e
+
+
 @app.after_request
 def headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
@@ -241,32 +305,43 @@ def static_files(name):
 
 # ---------------------------------------------------------------- items
 
+IMAGE_SQL = "content_type LIKE 'image/%' AND content_type != 'image/svg+xml'"
+
+
 @app.get("/api/items")
 def list_items():
     conn = db()
     items = [item_out(r) for r in conn.execute("SELECT * FROM items ORDER BY lower(name)")]
-    thumbs = {}
-    for r in conn.execute(
-        "SELECT item_id, MIN(id) AS id FROM attachments "
-        "WHERE content_type LIKE 'image/%' AND content_type != 'image/svg+xml' GROUP BY item_id"
-    ):
-        thumbs[r["item_id"]] = r["id"]
+    first_image = {r["item_id"]: r["id"] for r in conn.execute(
+        f"SELECT item_id, MIN(id) AS id FROM attachments WHERE {IMAGE_SQL} GROUP BY item_id")}
     due = {}
     for r in conn.execute("SELECT * FROM tasks"):
         if task_out(r)["days_left"] <= 0:
             due[r["item_id"]] = due.get(r["item_id"], 0) + 1
     for it in items:
-        it["thumb_id"] = thumbs.get(it["id"])
+        # Picture shown for the item: chosen cover photo > chosen emoji > first photo > category icon
+        if it.get("cover_id"):
+            it["thumb_id"] = it["cover_id"]
+        elif it.get("icon"):
+            it["thumb_id"] = None
+        else:
+            it["thumb_id"] = first_image.get(it["id"])
         it["tasks_due"] = due.get(it["id"], 0)
     return jsonify(items)
 
 
+def save_terms(conn, v):
+    v["category"] = canonical_term(conn, "categories", v["category"])
+    v["location"] = canonical_term(conn, "locations", v["location"])
+
+
 @app.post("/api/items")
 def create_item():
+    conn = db()
     v = clean_item_payload(request.get_json(force=True) or {})
+    save_terms(conn, v)
     cols = list(v.keys()) + ["created_at", "updated_at"]
     vals = list(v.values()) + [now(), now()]
-    conn = db()
     cur = conn.execute(
         f"INSERT INTO items ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})", vals
     )
@@ -280,7 +355,7 @@ def get_item(item_id):
     it = item_out(get_item_row(item_id))
     conn = db()
     it["attachments"] = [dict(r) for r in conn.execute(
-        "SELECT id, filename, content_type, size, created_at FROM attachments "
+        "SELECT id, filename, title, kind, content_type, size, created_at FROM attachments "
         "WHERE item_id = ? ORDER BY id", (item_id,))]
     it["tasks"] = sorted((task_out(r) for r in conn.execute(
         "SELECT * FROM tasks WHERE item_id = ?", (item_id,))), key=lambda t: t["days_left"])
@@ -290,15 +365,35 @@ def get_item(item_id):
 @app.put("/api/items/<int:item_id>")
 def update_item(item_id):
     get_item_row(item_id)
-    v = clean_item_payload(request.get_json(force=True) or {})
-    v["updated_at"] = now()
     conn = db()
+    v = clean_item_payload(request.get_json(force=True) or {})
+    save_terms(conn, v)
+    v["updated_at"] = now()
     conn.execute(
         f"UPDATE items SET {', '.join(f'{k} = ?' for k in v)} WHERE id = ?",
         list(v.values()) + [item_id],
     )
     conn.commit()
     changed()
+    return jsonify(item_out(get_item_row(item_id)))
+
+
+@app.put("/api/items/<int:item_id>/appearance")
+def set_appearance(item_id):
+    """Set the item's picture: {"icon": "🔥"} or {"cover_id": 12}, or {} for automatic."""
+    get_item_row(item_id)
+    data = request.get_json(force=True) or {}
+    conn = db()
+    icon = (str(data.get("icon") or "").strip()[:16]) or None
+    cover = data.get("cover_id")
+    if cover is not None:
+        ok = conn.execute(f"SELECT 1 FROM attachments WHERE id = ? AND item_id = ? AND {IMAGE_SQL}",
+                          (cover, item_id)).fetchone()
+        if not ok:
+            abort(400, "That photo doesn't belong to this item")
+        icon = None
+    conn.execute("UPDATE items SET icon = ?, cover_id = ? WHERE id = ?", (icon, cover, item_id))
+    conn.commit()
     return jsonify(item_out(get_item_row(item_id)))
 
 
@@ -319,13 +414,23 @@ def delete_item(item_id):
     return "", 204
 
 
+def term_list(conn, url_name):
+    table, column = TERM_TABLES[url_name]
+    return [dict(r) for r in conn.execute(
+        f"SELECT t.id, t.name, t.icon, "
+        f"(SELECT COUNT(*) FROM items i WHERE i.{column} = t.name COLLATE NOCASE) AS count "
+        f"FROM {table} t ORDER BY lower(t.name)")]
+
+
 @app.get("/api/meta")
 def meta():
     conn = db()
     def distinct(col):
         return [r[0] for r in conn.execute(
             f"SELECT DISTINCT {col} FROM items WHERE {col} IS NOT NULL ORDER BY lower({col})")]
-    return jsonify({"categories": distinct("category"), "locations": distinct("location"),
+    return jsonify({"categories": term_list(conn, "categories"),
+                    "locations": term_list(conn, "locations"),
+                    "attachment_kinds": ATTACHMENT_KINDS,
                     "vendors": distinct("purchased_from"), "manufacturers": distinct("manufacturer")})
 
 
@@ -337,15 +442,87 @@ def summary():
     return jsonify(data)
 
 
+# ---------------------------------------------------------------- categories & locations
+
+def term_table(url_name):
+    if url_name not in TERM_TABLES:
+        abort(404)
+    return TERM_TABLES[url_name]
+
+
+def clean_term(data):
+    name = str(data.get("name") or "").strip()[:80]
+    if not name:
+        abort(400, "Name is required")
+    icon = str(data.get("icon") or "").strip()[:16] or None
+    return name, icon
+
+
+@app.post("/api/<any(categories, locations):kind>")
+def create_term(kind):
+    table, _ = term_table(kind)
+    name, icon = clean_term(request.get_json(force=True) or {})
+    conn = db()
+    try:
+        conn.execute(f"INSERT INTO {table} (name, icon) VALUES (?, ?)", (name, icon))
+    except sqlite3.IntegrityError:
+        abort(409, f"“{name}” already exists")
+    conn.commit()
+    return jsonify(term_list(conn, kind)), 201
+
+
+@app.put("/api/<any(categories, locations):kind>/<int:term_id>")
+def update_term(kind, term_id):
+    table, column = term_table(kind)
+    name, icon = clean_term(request.get_json(force=True) or {})
+    conn = db()
+    old = conn.execute(f"SELECT name FROM {table} WHERE id = ?", (term_id,)).fetchone()
+    if old is None:
+        abort(404)
+    clash = conn.execute(f"SELECT id FROM {table} WHERE name = ? AND id != ?", (name, term_id)).fetchone()
+    if clash:
+        abort(409, f"“{name}” already exists")
+    conn.execute(f"UPDATE {table} SET name = ?, icon = ? WHERE id = ?", (name, icon, term_id))
+    # Renaming moves every item along with it
+    conn.execute(f"UPDATE items SET {column} = ? WHERE {column} = ? COLLATE NOCASE", (name, old["name"]))
+    conn.commit()
+    return jsonify(term_list(conn, kind))
+
+
+@app.delete("/api/<any(categories, locations):kind>/<int:term_id>")
+def delete_term(kind, term_id):
+    table, column = term_table(kind)
+    conn = db()
+    old = conn.execute(f"SELECT name FROM {table} WHERE id = ?", (term_id,)).fetchone()
+    if old is None:
+        abort(404)
+    # Optionally move its items to another entry; otherwise they become unassigned
+    move_to = request.args.get("move_to") or None
+    if move_to:
+        move_to = canonical_term(conn, kind, move_to)
+    conn.execute(f"UPDATE items SET {column} = ? WHERE {column} = ? COLLATE NOCASE", (move_to, old["name"]))
+    conn.execute(f"DELETE FROM {table} WHERE id = ?", (term_id,))
+    conn.commit()
+    return jsonify(term_list(conn, kind))
+
+
 # ---------------------------------------------------------------- attachments
 
 INLINE_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "application/pdf")
+
+
+def clean_kind(value, content_type):
+    if value in ATTACHMENT_KINDS:
+        return value
+    return "Photo" if content_type.startswith("image/") else "Other"
 
 
 @app.post("/api/items/<int:item_id>/attachments")
 def upload(item_id):
     get_item_row(item_id)
     conn = db()
+    kind = request.form.get("kind")
+    title = (request.form.get("title") or "").strip()[:200] or None
     saved = []
     for f in request.files.getlist("files"):
         if not f.filename:
@@ -356,9 +533,9 @@ def upload(item_id):
         f.save(path)
         ctype = f.mimetype or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
         cur = conn.execute(
-            "INSERT INTO attachments (item_id, filename, stored_name, content_type, size, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (item_id, f.filename, stored, ctype, os.path.getsize(path), now()))
+            "INSERT INTO attachments (item_id, filename, title, kind, stored_name, content_type, size, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (item_id, f.filename, title, clean_kind(kind, ctype), stored, ctype, os.path.getsize(path), now()))
         saved.append(cur.lastrowid)
     conn.commit()
     return jsonify({"ids": saved}), 201
@@ -370,8 +547,8 @@ def get_attachment(att_id):
     if r is None:
         abort(404)
     inline = r["content_type"] in INLINE_TYPES and request.args.get("download") is None
-    # Anything that isn't a plain image/PDF is forced to download so it can't
-    # run script in Home Assistant's origin.
+    # Anything that isn't a plain image/PDF is downloaded rather than shown,
+    # so an uploaded web page can never run inside the app.
     resp = send_from_directory(
         UPLOAD_DIR, r["stored_name"],
         mimetype=r["content_type"] if inline else "application/octet-stream",
@@ -380,12 +557,29 @@ def get_attachment(att_id):
     return resp
 
 
+@app.put("/api/attachments/<int:att_id>")
+def update_attachment(att_id):
+    conn = db()
+    r = conn.execute("SELECT * FROM attachments WHERE id = ?", (att_id,)).fetchone()
+    if r is None:
+        abort(404)
+    data = request.get_json(force=True) or {}
+    title = str(data.get("title") or "").strip()[:200] or None
+    conn.execute("UPDATE attachments SET title = ?, kind = ? WHERE id = ?",
+                 (title, clean_kind(data.get("kind"), r["content_type"]), att_id))
+    conn.commit()
+    return jsonify(dict(conn.execute(
+        "SELECT id, filename, title, kind, content_type, size, created_at FROM attachments WHERE id = ?",
+        (att_id,)).fetchone()))
+
+
 @app.delete("/api/attachments/<int:att_id>")
 def delete_attachment(att_id):
     conn = db()
     r = conn.execute("SELECT * FROM attachments WHERE id = ?", (att_id,)).fetchone()
     if r is None:
         abort(404)
+    conn.execute("UPDATE items SET cover_id = NULL WHERE cover_id = ?", (att_id,))
     conn.execute("DELETE FROM attachments WHERE id = ?", (att_id,))
     conn.commit()
     try:
@@ -464,7 +658,8 @@ def export_json():
         it = item_out(r)
         it["tasks"] = [dict(t) for t in conn.execute("SELECT * FROM tasks WHERE item_id = ?", (r["id"],))]
         it["attachments"] = [dict(a) for a in conn.execute(
-            "SELECT id, filename, content_type, size FROM attachments WHERE item_id = ?", (r["id"],))]
+            "SELECT id, filename, title, kind, content_type, size FROM attachments WHERE item_id = ?",
+            (r["id"],))]
         items.append(it)
     body = json.dumps({"exported_at": now(), "items": items}, indent=2)
     return Response(body, mimetype="application/json", headers={
@@ -481,6 +676,273 @@ def export_csv():
         w.writerow([r["id"]] + [r[f] or "" for f in ITEM_FIELDS] + [extras])
     return Response(buf.getvalue(), mimetype="text/csv", headers={
         "Content-Disposition": f"attachment; filename=home-inventory-{date.today()}.csv"})
+
+
+# ---------------------------------------------------------------- import (spreadsheet + bulk API)
+
+MAX_IMPORT_ROWS = 5000
+DATE_FIELDS = ("purchase_date", "warranty_expires")
+
+# Spreadsheet headers we recognise for each field (compared ignoring case, spaces and punctuation)
+FIELD_ALIASES = {
+    "id": ["id", "item id"],
+    "name": ["name", "item", "item name", "title", "equipment", "appliance", "description"],
+    "category": ["category", "type", "item type", "group", "system"],
+    "location": ["location", "room", "area", "where", "place"],
+    "manufacturer": ["manufacturer", "make", "brand", "mfr", "mfg", "maker"],
+    "model": ["model", "model number", "model no", "model #", "model num"],
+    "serial_number": ["serial number", "serial", "serial no", "serial #", "sn", "s/n", "serial num"],
+    "purchased_from": ["purchased from", "vendor", "store", "retailer", "seller", "supplier", "bought from", "dealer"],
+    "installer": ["installer", "installed by", "contractor", "installation company", "builder"],
+    "purchase_date": ["purchase date", "date purchased", "purchased", "bought", "install date",
+                      "installation date", "installed", "date installed", "date"],
+    "purchase_price": ["purchase price", "price", "cost", "amount", "paid"],
+    "warranty_expires": ["warranty expires", "warranty", "warranty end", "warranty expiration",
+                         "warranty expiry", "warranty until", "warranty end date", "warranty expiration date"],
+    "website_url": ["website url", "website", "web site", "url", "link", "product url", "product page"],
+    "manual_url": ["manual url", "manual", "manual link", "owners manual", "user manual"],
+    "support_url": ["support url", "support site", "support website", "support link", "warranty registration"],
+    "support_phone": ["support phone", "phone", "support number", "customer service", "telephone", "tel"],
+    "support_email": ["support email", "email", "e-mail", "support e-mail"],
+    "operating_notes": ["operating notes", "operating details", "operation", "operating instructions",
+                        "instructions", "how to use", "how to operate", "usage"],
+    "notes": ["notes", "note", "comments", "comment", "remarks"],
+    "custom_fields": ["custom fields", "custom_fields", "extra fields", "more details"],
+}
+
+
+def _norm(header):
+    return re.sub(r"[^a-z0-9#]", "", str(header).lower())
+
+
+HEADER_LOOKUP = {}
+for _field, _names in FIELD_ALIASES.items():
+    for _n in [_field] + _names:
+        HEADER_LOOKUP.setdefault(_norm(_n), _field)
+
+
+def suggest_field(header):
+    """Field a spreadsheet column most likely holds; unknown columns become custom fields."""
+    return HEADER_LOOKUP.get(_norm(header), "extra")
+
+
+def cell_text(v):
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.date().isoformat() if (v.hour, v.minute, v.second) == (0, 0, 0) else v.isoformat(sep=" ")
+    if isinstance(v, date):
+        return v.isoformat()
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))  # 12345.0 -> "12345" (serial numbers, years)
+    return str(v).strip()
+
+
+def read_table(upload):
+    name = (upload.filename or "").lower()
+    data = upload.read()
+    if name.endswith(".xls"):
+        abort(400, "That's the old .xls format. In Excel use File → Save As → Excel Workbook (.xlsx) or CSV.")
+    if name.endswith((".xlsx", ".xlsm")) or data[:2] == b"PK":
+        try:
+            import openpyxl
+        except ImportError:
+            abort(400, "Excel support isn't installed on this server. Save the sheet as CSV and import that.")
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        except Exception:
+            abort(400, "Couldn't open that Excel file. Try saving it again as .xlsx or CSV.")
+        ws = wb.active or wb.worksheets[0]
+        rows = [[cell_text(c) for c in r] for r in ws.iter_rows(values_only=True)]
+        wb.close()
+    else:
+        for enc in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = data.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        try:
+            dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = [[c.strip() for c in r] for r in csv.reader(io.StringIO(text), dialect)]
+
+    numbered = [(n, r) for n, r in enumerate(rows, 1) if any(c for c in r)]  # keep sheet row numbers
+    if not numbered:
+        abort(400, "That file has no rows.")
+    header, body = numbered[0][1], numbered[1:]
+    width = max(len(r) for _, r in numbered)
+    header = [h or f"Column {i + 1}" for i, h in enumerate(header + [""] * (width - len(header)))]
+    lines = [n for n, _ in body]
+    body = [r + [""] * (width - len(r)) for _, r in body]
+    if len(body) > MAX_IMPORT_ROWS:
+        abort(400, f"Too many rows ({len(body)}). Split the file into parts of {MAX_IMPORT_ROWS} rows.")
+    return header, body, lines
+
+
+@app.post("/api/import/parse")
+def import_parse():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        abort(400, "Choose a .csv or .xlsx file")
+    header, body, lines = read_table(f)
+    return jsonify({"filename": f.filename, "headers": header, "rows": body, "lines": lines,
+                    "suggested": [suggest_field(h) for h in header]})
+
+
+def flexible_date(value):
+    s = str(value).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{5}(\.0+)?", s) and 20000 < float(s) < 80000:  # Excel serial date number
+        return (date(1899, 12, 30) + timedelta(days=int(float(s)))).isoformat()
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y",
+                "%m-%d-%Y", "%m.%d.%Y", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y", "%d %b %Y",
+                "%d %B %Y", "%m/%Y", "%Y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            pass
+    raise ValueError(f"“{s}” isn't a date I recognise (use e.g. 2026-03-15 or 3/15/2026)")
+
+
+def parse_extra_fields(value):
+    """Accept [{label, value}], {label: value} or the export's "Label: value; Label: value" text."""
+    if isinstance(value, dict):
+        value = [{"label": k, "value": v} for k, v in value.items()]
+    elif isinstance(value, str):
+        pairs = []
+        for part in value.split(";"):
+            if part.strip():
+                label, _, val = part.partition(":")
+                pairs.append({"label": label.strip(), "value": val.strip()} if val else {"label": "", "value": label.strip()})
+        value = pairs
+    out = []
+    for ef in value or []:
+        if isinstance(ef, dict):
+            label, val = cell_text(ef.get("label")), cell_text(ef.get("value"))
+            if label or val:
+                out.append({"label": label, "value": val})
+    return out
+
+
+def import_one(conn, row, update_existing):
+    data = {}
+    for field in ITEM_FIELDS:
+        v = cell_text(row.get(field))
+        if v:
+            data[field] = v
+    for field in DATE_FIELDS:
+        if field in data:
+            data[field] = flexible_date(data[field])
+    extras = parse_extra_fields(row.get("extra_fields")) + parse_extra_fields(row.get("custom_fields"))
+
+    existing = None
+    if update_existing:
+        rid = cell_text(row.get("id"))
+        if rid.isdigit():
+            existing = conn.execute("SELECT * FROM items WHERE id = ?", (int(rid),)).fetchone()
+        if existing is None and data.get("serial_number"):
+            existing = conn.execute("SELECT * FROM items WHERE serial_number = ? COLLATE NOCASE",
+                                    (data["serial_number"],)).fetchone()
+        if existing is None and data.get("name") and not data.get("serial_number"):
+            # Same name - but only when exactly one item has it, so we never guess between two
+            same = conn.execute("SELECT * FROM items WHERE name = ? COLLATE NOCASE", (data["name"],)).fetchall()
+            if len(same) == 1:
+                existing = same[0]
+    if existing is None and not data.get("name"):
+        raise ValueError("Name is required for a new item")
+
+    if "category" in data:
+        data["category"] = canonical_term(conn, "categories", data["category"])
+    if "location" in data:
+        data["location"] = canonical_term(conn, "locations", data["location"])
+
+    if existing is not None:
+        # Only fill in what the row provides; blank cells never erase existing details.
+        merged = item_out(existing)["extra_fields"]
+        for ef in extras:
+            hit = next((m for m in merged if m["label"].lower() == ef["label"].lower() and ef["label"]), None)
+            if hit:
+                hit["value"] = ef["value"]
+            else:
+                merged.append(ef)
+        data["extra_fields"] = json.dumps(merged)
+        data["updated_at"] = now()
+        conn.execute(f"UPDATE items SET {', '.join(f'{k} = ?' for k in data)} WHERE id = ?",
+                     list(data.values()) + [existing["id"]])
+        return "updated", existing["id"], data.get("name") or existing["name"]
+
+    data["extra_fields"] = json.dumps(extras)
+    data["created_at"] = data["updated_at"] = now()
+    cur = conn.execute(f"INSERT INTO items ({', '.join(data)}) VALUES ({', '.join('?' * len(data))})",
+                       list(data.values()))
+    return "created", cur.lastrowid, data["name"]
+
+
+@app.post("/api/import")
+def import_items():
+    """Bulk create/update. Body: [items] or {"items": [...], "update_existing": true, "dry_run": false}."""
+    payload = request.get_json(force=True, silent=True)
+    items = payload if isinstance(payload, list) else (payload or {}).get("items")
+    opts = payload if isinstance(payload, dict) else {}
+    if not isinstance(items, list):
+        abort(400, 'Send JSON: a list of items, or {"items": [...]}')
+    if len(items) > MAX_IMPORT_ROWS:
+        abort(400, f"At most {MAX_IMPORT_ROWS} items per request")
+    update_existing = bool(opts.get("update_existing", True))
+    dry_run = bool(opts.get("dry_run")) or request.args.get("dry_run") in ("1", "true", "yes")
+
+    conn = db()
+    results, errors = [], []
+    for n, row in enumerate(items, 1):
+        row_no = row.get("_row", n) if isinstance(row, dict) else n
+        if not isinstance(row, dict):
+            errors.append({"row": row_no, "error": "Each item must be a JSON object"})
+            continue
+        try:
+            action, item_id, name = import_one(conn, row, update_existing)
+            results.append({"row": row_no, "action": action, "id": item_id, "name": name})
+        except ValueError as e:
+            errors.append({"row": row_no, "name": cell_text(row.get("name")), "error": str(e)})
+    if dry_run:
+        conn.rollback()
+        for r in results:
+            if r["action"] == "created":
+                r["id"] = None  # nothing was saved
+    else:
+        conn.commit()
+        changed()
+    return jsonify({
+        "dry_run": dry_run,
+        "created": sum(r["action"] == "created" for r in results),
+        "updated": sum(r["action"] == "updated" for r in results),
+        "errors": errors,
+        "results": results,
+    })
+
+
+@app.get("/api/import/template.csv")
+def import_template():
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(ITEM_FIELDS + ["custom_fields"])
+    examples = [
+        {"name": "Patio heater (east)", "category": "Outdoor", "location": "Back patio", "manufacturer": "Bromic",
+         "model": "BH0420002", "serial_number": "SN-0001", "purchased_from": "Fireside Outdoor",
+         "installer": "ABC Builders", "purchase_date": "2026-06-01", "purchase_price": "1899",
+         "warranty_expires": "2028-06-01", "website_url": "bromic.com", "support_phone": "800-555-0100",
+         "operating_notes": "Turn on at the wall switch, then use the remote.",
+         "custom_fields": "Gas type: Natural gas; BTU: 39000"},
+        {"name": "Refrigerator", "category": "Appliances", "location": "Kitchen", "manufacturer": "Sub-Zero",
+         "model": "CL3650UFD", "serial_number": "SN-0002", "purchase_date": "6/15/2026",
+         "custom_fields": "Water filter: 4204490"},
+    ]
+    for ex in examples:
+        w.writerow([ex.get(f, "") for f in ITEM_FIELDS + ["custom_fields"]])
+    return Response(buf.getvalue(), mimetype="text/csv", headers={
+        "Content-Disposition": "attachment; filename=home-inventory-template.csv"})
 
 
 # ---------------------------------------------------------------- Home Assistant sensors
