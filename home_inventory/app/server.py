@@ -25,12 +25,14 @@ from werkzeug.utils import secure_filename
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "inventory.db")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+ICON_DIR = os.path.join(DATA_DIR, "icons")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PORT = int(os.environ.get("PORT", "8099"))
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN")
 INGRESS_IP = "172.30.32.2"  # Home Assistant's ingress proxy
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(ICON_DIR, exist_ok=True)
 
 
 def load_options():
@@ -99,6 +101,13 @@ CREATE TABLE IF NOT EXISTS locations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
     icon TEXT
+);
+CREATE TABLE IF NOT EXISTS icons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    stored_name TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -431,6 +440,7 @@ def meta():
     return jsonify({"categories": term_list(conn, "categories"),
                     "locations": term_list(conn, "locations"),
                     "attachment_kinds": ATTACHMENT_KINDS,
+                    "icons": icon_list(conn),
                     "vendors": distinct("purchased_from"), "manufacturers": distinct("manufacturer")})
 
 
@@ -448,6 +458,10 @@ def term_table(url_name):
     if url_name not in TERM_TABLES:
         abort(404)
     return TERM_TABLES[url_name]
+
+
+def default_category_icon(name):
+    return next((ic for n, ic in DEFAULT_CATEGORIES.items() if n.lower() == name.lower()), None)
 
 
 def clean_term(data):
@@ -482,6 +496,8 @@ def update_term(kind, term_id):
     clash = conn.execute(f"SELECT id FROM {table} WHERE name = ? AND id != ?", (name, term_id)).fetchone()
     if clash:
         abort(409, f"“{name}” already exists")
+    if not icon and table == "categories":
+        icon = default_category_icon(name)  # "Default icon" means the built-in one, if there is one
     conn.execute(f"UPDATE {table} SET name = ?, icon = ? WHERE id = ?", (name, icon, term_id))
     # Renaming moves every item along with it
     conn.execute(f"UPDATE items SET {column} = ? WHERE {column} = ? COLLATE NOCASE", (name, old["name"]))
@@ -504,6 +520,107 @@ def delete_term(kind, term_id):
     conn.execute(f"DELETE FROM {table} WHERE id = ?", (term_id,))
     conn.commit()
     return jsonify(term_list(conn, kind))
+
+
+# ---------------------------------------------------------------- custom icons
+# Uploaded icons are referenced from items/categories/locations as "img:<id>"
+# in the same `icon` column that otherwise holds an emoji.
+
+ICON_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+              "image/webp": ".webp", "image/svg+xml": ".svg"}
+ICON_EXT_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                  ".webp": "image/webp", ".svg": "image/svg+xml"}
+MAX_ICON_BYTES = 2 * 1024 * 1024
+
+
+def icon_list(conn):
+    return [dict(r) for r in conn.execute(
+        "SELECT ic.id, ic.name, ic.content_type, "
+        "  (SELECT COUNT(*) FROM items WHERE icon = 'img:' || ic.id)"
+        " + (SELECT COUNT(*) FROM categories WHERE icon = 'img:' || ic.id)"
+        " + (SELECT COUNT(*) FROM locations WHERE icon = 'img:' || ic.id) AS uses "
+        "FROM icons ic ORDER BY lower(ic.name), ic.id")]
+
+
+@app.get("/api/icons")
+def list_icons():
+    return jsonify(icon_list(db()))
+
+
+@app.post("/api/icons")
+def upload_icons():
+    conn = db()
+    files = [f for f in request.files.getlist("files") if f.filename]
+    if not files:
+        abort(400, "Choose one or more image files")
+    given_name = (request.form.get("name") or "").strip()[:60]
+    added, errors = [], []
+    for f in files:
+        ext = os.path.splitext(f.filename)[1].lower()
+        ctype = f.mimetype if f.mimetype in ICON_TYPES else ICON_EXT_TYPES.get(ext)
+        if not ctype:
+            errors.append(f"{f.filename}: use PNG, SVG, JPG, WebP or GIF")
+            continue
+        data = f.read()
+        if len(data) > MAX_ICON_BYTES:
+            errors.append(f"{f.filename}: larger than 2 MB")
+            continue
+        stored = uuid.uuid4().hex + ICON_TYPES[ctype]
+        with open(os.path.join(ICON_DIR, stored), "wb") as out:
+            out.write(data)
+        name = given_name if (given_name and len(files) == 1) else \
+            re.sub(r"[_\-]+", " ", os.path.splitext(f.filename)[0]).strip()[:60] or "Icon"
+        cur = conn.execute("INSERT INTO icons (name, stored_name, content_type, created_at) VALUES (?, ?, ?, ?)",
+                           (name, stored, ctype, now()))
+        added.append(cur.lastrowid)
+    conn.commit()
+    if not added:
+        abort(400, "; ".join(errors))
+    return jsonify({"added": added, "errors": errors, "icons": icon_list(conn)}), 201
+
+
+@app.get("/api/icons/<int:icon_id>")
+def get_icon(icon_id):
+    r = db().execute("SELECT * FROM icons WHERE id = ?", (icon_id,)).fetchone()
+    if r is None:
+        abort(404)
+    resp = send_from_directory(ICON_DIR, r["stored_name"], mimetype=r["content_type"], max_age=31536000)
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    # An SVG opened on its own can contain script; this keeps it inert.
+    resp.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+    return resp
+
+
+@app.put("/api/icons/<int:icon_id>")
+def rename_icon(icon_id):
+    name = str((request.get_json(force=True) or {}).get("name") or "").strip()[:60]
+    if not name:
+        abort(400, "Name is required")
+    conn = db()
+    if conn.execute("UPDATE icons SET name = ? WHERE id = ?", (name, icon_id)).rowcount == 0:
+        abort(404)
+    conn.commit()
+    return jsonify(icon_list(conn))
+
+
+@app.delete("/api/icons/<int:icon_id>")
+def delete_icon(icon_id):
+    conn = db()
+    r = conn.execute("SELECT * FROM icons WHERE id = ?", (icon_id,)).fetchone()
+    if r is None:
+        abort(404)
+    ref = f"img:{icon_id}"
+    for c in conn.execute("SELECT id, name FROM categories WHERE icon = ?", (ref,)).fetchall():
+        conn.execute("UPDATE categories SET icon = ? WHERE id = ?", (default_category_icon(c["name"]), c["id"]))
+    for table in ("items", "locations"):
+        conn.execute(f"UPDATE {table} SET icon = NULL WHERE icon = ?", (ref,))  # fall back to default
+    conn.execute("DELETE FROM icons WHERE id = ?", (icon_id,))
+    conn.commit()
+    try:
+        os.remove(os.path.join(ICON_DIR, r["stored_name"]))
+    except OSError:
+        pass
+    return jsonify(icon_list(conn))
 
 
 # ---------------------------------------------------------------- attachments
