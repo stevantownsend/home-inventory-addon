@@ -254,7 +254,7 @@ async function route() {
     if (parts[0] === 'item' && parts[1]) await viewItem(+parts[1]);
     else if (parts[0] === 'edit' && parts[1]) await viewEdit(+parts[1]);
     else if (parts[0] === 'new') await viewEdit(null);
-    else if (parts[0] === 'manage') await viewManage();
+    else if (parts[0] === 'settings' || parts[0] === 'manage') await viewManage(parts[1]);
     else if (parts[0] === 'import') await viewImport();
     else await viewHome();
   } catch (e) {
@@ -265,7 +265,7 @@ window.addEventListener('hashchange', route);
 
 // ------------------------------------------------------------------ home
 async function viewHome() {
-  setHeader('Home Inventory', false, '<a class="iconbtn" href="#/manage" aria-label="Manage categories and locations">⚙️</a>');
+  setHeader('Home Inventory', false, '<a class="iconbtn" href="#/settings" aria-label="Settings">⚙️</a>');
   const [items, summary] = await Promise.all([api('items'), api('summary'), loadMeta()]);
   state.items = items;
 
@@ -295,7 +295,7 @@ async function viewHome() {
           <a class="btn primary" href="#/new">Add your first item</a>
           <a class="btn" href="#/import">Import a spreadsheet</a>
         </div>
-        <p><a href="#/manage">Set up categories & locations</a></p>
+        <p><a href="#/settings/categories">Set up categories & locations</a></p>
       </div>`;
     return;
   }
@@ -315,7 +315,7 @@ async function viewHome() {
     </div>
     <div id="list"></div>
     <nav class="footer-links">
-      <a href="#/manage">⚙️ Categories & locations</a>
+      <a href="#/settings">⚙️ Settings</a>
       <a href="#/import">⬆ Import from Excel / CSV</a>
       <a href="api/export.csv" download>⬇ Export spreadsheet (CSV)</a>
       <a href="api/export.json" download>⬇ Export backup (JSON)</a>
@@ -601,7 +601,7 @@ async function viewEdit(id) {
           ${termSelect('category', 'categories', 'Category', '— None —')}
           ${termSelect('location', 'locations', 'Location / room', '— None —')}
         </div>
-        <p class="hint"><a href="#/manage">Manage categories & locations</a></p>
+        <p class="hint"><a href="#/settings/categories">Manage categories & locations</a></p>
       </section>
 
       <section class="card"><h3>Identification</h3>
@@ -707,9 +707,14 @@ async function viewEdit(id) {
 // ------------------------------------------------------------------ manage categories & locations
 const TERM_LABEL = { categories: ['Categories', 'category'], locations: ['Locations / rooms', 'location'] };
 
-async function viewManage() {
-  setHeader('Categories & locations', '#/');
+const SETTINGS_TABS = [['categories', 'Categories'], ['locations', 'Locations'], ['icons', 'Your icons']];
+let settingsTab = 'categories';
+
+async function viewManage(tab) {
+  if (SETTINGS_TABS.some(([k]) => k === tab)) settingsTab = tab;
+  setHeader('Settings', '#/');
   await loadMeta();
+  const counts = { categories: state.meta.categories.length, locations: state.meta.locations.length, icons: state.meta.icons.length };
   const block = (kind) => {
     const [title, one] = TERM_LABEL[kind];
     const rows = state.meta[kind].map((t) => `
@@ -729,10 +734,7 @@ async function viewManage() {
         ${rows || `<p class="hint" style="padding-bottom:12px">No ${title.toLowerCase()} yet.</p>`}
       </section>`;
   };
-  $app.innerHTML = `
-    <p class="hint">Tap an icon to change it, or pick one you uploaded. Renaming updates every item that uses it.</p>
-    ${block('categories')}
-    ${block('locations')}
+  const iconsBlock = () => `
     <section class="card">
       <h3>Your icons <span class="count">${state.meta.icons.length}</span></h3>
       <p class="hint">Upload your own icons (PNG, SVG, JPG, WebP or GIF, up to 2 MB). Then choose them for items, categories or locations.
@@ -749,7 +751,20 @@ async function viewManage() {
           <button type="button" class="copy" data-act="icon-del" data-id="${i.id}" aria-label="Delete icon ${esc(i.name)}">✕</button>
         </div>`).join('')}
     </section>`;
-  document.getElementById('manageiconupload').addEventListener('change', async (e) => {
+  $app.innerHTML = `
+    <nav class="settings-tabs" aria-label="Settings sections">
+      <div class="seg" role="tablist">
+        ${SETTINGS_TABS.map(([k, label]) => `<button type="button" role="tab" data-settings-tab="${k}" aria-selected="${settingsTab === k}" aria-pressed="${settingsTab === k}">${label} <span class="count">${counts[k]}</span></button>`).join('')}
+      </div>
+    </nav>
+    ${settingsTab === 'icons' ? '' : '<p class="hint">Tap an icon to change it, or pick one you uploaded. Renaming updates every item that uses it.</p>'}
+    ${settingsTab === 'icons' ? iconsBlock() : block(settingsTab)}`;
+  $app.querySelectorAll('[data-settings-tab]').forEach((b) => b.addEventListener('click', () => {
+    settingsTab = b.dataset.settingsTab;
+    history.replaceState(null, '', `#/settings/${settingsTab}`);
+    viewManage();
+  }));
+  document.getElementById('manageiconupload')?.addEventListener('change', async (e) => {
     if (await uploadIcons(e.target.files)) viewManage();
   });
 
